@@ -8,7 +8,7 @@ use std::{
 };
 
 use http::{Request, Response};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 #[cfg(any(feature = "signed", feature = "private"))]
 use tower_cookies::Key;
 use tower_cookies::{cookie::SameSite, Cookie, CookieManager, Cookies};
@@ -100,6 +100,7 @@ struct SessionConfig<'a> {
     path: Cow<'a, str>,
     domain: Option<Cow<'a, str>>,
     always_save: bool,
+    stale_duration: Duration,
 }
 
 impl<'a> SessionConfig<'a> {
@@ -137,6 +138,7 @@ impl Default for SessionConfig<'_> {
             path: "/".into(),
             domain: None,
             always_save: false,
+            stale_duration: Duration::ZERO,
         }
     }
 }
@@ -224,10 +226,12 @@ where
 
                 let modified = session.is_modified();
                 let empty = session.is_empty().await;
+                let is_stale = session.expiry_age() < session_config.stale_duration;
 
                 tracing::trace!(
                     modified = modified,
                     empty = empty,
+                    is_stale = is_stale,
                     always_save = session_config.always_save,
                     "session response state",
                 );
@@ -248,7 +252,7 @@ where
                         cookie_controller.remove(&cookies, cookie);
                     }
 
-                    _ if (modified || session_config.always_save)
+                    _ if (modified || session_config.always_save || is_stale)
                         && !empty
                         && !res.status().is_server_error() =>
                     {
@@ -444,6 +448,38 @@ impl<Store: SessionStore, C: CookieController> SessionManagerLayer<Store, C> {
     /// ```
     pub fn with_always_save(mut self, always_save: bool) -> Self {
         self.session_config.always_save = always_save;
+        self
+    }
+
+    /// Configures when an unmodified session should be saved before it expires.
+    /// The session will be saved if less than `state_duration` is left before
+    /// it expires.
+    ///
+    /// This is useful when you want to reset [`Session`] expiration time
+    /// frequently, but not on every request to avoid unnecessary writes to
+    /// the [`SessionStore`].
+    ///
+    /// It makes sense to use this setting with relative session expiration
+    /// values, such as `Expiry::OnInactivity(Duration)`. This setting will
+    /// _not_ cause session id to be cycled on save.
+    ///
+    /// The default value is `Duration::ZERO`, meaning that stale sessions will
+    /// not be refreshed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use time::Duration;
+    /// use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
+    ///
+    /// let session_store = MemoryStore::default();
+    /// let session_expiry = Expiry::OnInactivity(Duration::hours(1));
+    /// let session_service = SessionManagerLayer::new(session_store)
+    ///     .with_expiry(session_expiry)
+    ///     .reset_stale(Some(Duration::minutes(15)));
+    /// ```
+    pub fn reset_stale(mut self, stale_duration: Duration) -> Self {
+        self.session_config.stale_duration = stale_duration;
         self
     }
 
